@@ -1,141 +1,197 @@
-let model = null;
-let labels = {};
-let lastSpokenChar = "";
-let predictionBuffer = [];
-const BUFFER_SIZE = 12; // Prediksi harus konsisten 12 frame berturut-turut
+/**
+ * js/app.js
+ * Logika utama deteksi webcam, inferensi TensorFlow.js (126 fitur),
+ * visualisasi kerangka tangan ganda, dan sintesis suara (TTS).
+ */
 
-const videoElement = document.getElementById('webcam');
-const canvasElement = document.getElementById('output-canvas');
+const videoElement = document.getElementById('webcam') || document.querySelector('video');
+const canvasElement = document.getElementById('output_canvas') || document.querySelector('canvas');
 const canvasCtx = canvasElement.getContext('2d');
-const predictedCharEl = document.getElementById('predicted-char');
-const confidenceEl = document.getElementById('confidence-score');
-const accumulatedTextEl = document.getElementById('accumulated-text');
-const loadingOverlay = document.getElementById('loading-overlay');
 
-// 1. Normalisasi Koordinat (Identik dengan versi Python)
-function normalizeLandmarks(landmarks) {
-  const base = landmarks[0];
-  let relCoords = [];
-  let maxDist = 0;
+// Elemen UI
+const currentPredictionEl = document.getElementById('current-sign') || document.querySelector('.prediction-char') || document.querySelector('h2');
+const accuracyEl = document.getElementById('accuracy-val') || document.querySelector('.accuracy-value');
+const sentenceEl = document.getElementById('sentence-text') || document.querySelector('.sentence-box');
+const btnSpeak = document.getElementById('btn-speak') || document.querySelector('button[onclick*="speak"]');
+const btnClear = document.getElementById('btn-clear') || document.querySelector('button[onclick*="clear"]');
 
-  // Hitung koordinat relatif terhadap pergelangan tangan (wrist / index 0)
-  for (let i = 0; i < 21; i++) {
-    const dx = landmarks[i].x - base.x;
-    const dy = landmarks[i].y - base.y;
-    const dz = landmarks[i].z - base.z;
-    relCoords.push(dx, dy, dz);
+let model = null;
+let isModelReady = false;
 
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dist > maxDist) maxDist = dist;
-  }
+// Variabel stabilisasi deteksi (Debounce)
+let consecutiveCount = 0;
+let lastDetectedChar = "";
+const CONSECUTIVE_THRESHOLD = 8; // Harus konsisten selama 8 frame
+const CONFIDENCE_THRESHOLD = 0.75; // Minimal akurasi 75%
+let sentenceBuffer = [];
 
-  // Penskalaan dengan membagi jarak terjauh
-  if (maxDist > 0) {
-    relCoords = relCoords.map(val => val / maxDist);
-  }
-  return relCoords;
-}
-
-// 2. Fungsi Text-to-Speech
-function speak(text) {
-  if ('speechSynthesis' in window && text.trim().length > 0) {
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'id-ID';
-    utterance.rate = 1.0;
-    window.speechSynthesis.speak(utterance);
-  }
-}
-
-// 3. Muat Model TFJS dan Mapping Label
-async function loadResources() {
+// 1. Inisialisasi Model TensorFlow.js & Labels
+async function initModel() {
   try {
-    model = await tf.loadLayersModel('./model_web/model.json');
-    const response = await fetch('./model_web/labels.json');
-    labels = await response.json();
-    loadingOverlay.style.display = 'none';
-    console.log("Model dan label berhasil dimuat.");
+    console.log("Memuat model dan daftar label...");
+    await window.loadSignLabels();
+    model = await tf.loadLayersModel('model_web/model.json');
+    isModelReady = true;
+    console.log("Model AI berhasil dimuat!");
   } catch (err) {
-    loadingOverlay.innerText = "Gagal memuat model. Pastikan file model_web lengkap.";
-    console.error(err);
+    console.error("Gagal memuat model:", err);
+    alert("Gagal memuat model_web/model.json. Pastikan berkas sudah diunggah ke GitHub.");
   }
 }
+initModel();
 
-// 4. Callback Pemrosesan Landmark MediaPipe
-async function onResults(results) {
-  canvasElement.width = videoElement.videoWidth;
-  canvasElement.height = videoElement.videoHeight;
+// 2. Hubungkan Titik Sendi MediaPipe (Koneksi Kerangka Tangan)
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],       // Ibu jari
+  [0, 5], [5, 6], [6, 7], [7, 8],       // Telunjuk
+  [5, 9], [9, 10], [10, 11], [11, 12],  // Jari tengah
+  [9, 13], [13, 14], [14, 15], [15, 16],// Jari manis
+  [13, 17], [17, 18], [18, 19], [19, 20],// Kelingking
+  [0, 17]                               // Telapak bawah
+];
 
-  canvasCtx.save();
-  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-  canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+function drawSkeleton(landmarksList) {
+  landmarksList.forEach(landmarks => {
+    // Gambar garis penghubung hijau
+    canvasCtx.strokeStyle = '#22c55e';
+    canvasCtx.lineWidth = 3;
+    HAND_CONNECTIONS.forEach(([i, j]) => {
+      const p1 = landmarks[i];
+      const p2 = landmarks[j];
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(p1.x * canvasElement.width, p1.y * canvasElement.height);
+      canvasCtx.lineTo(p2.x * canvasElement.width, p2.y * canvasElement.height);
+      canvasCtx.stroke();
+    });
 
-  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0 && model) {
-    const handLandmarks = results.multiHandLandmarks[0];
-
-    // Gambar skeleton tangan
-    drawConnectors(canvasCtx, handLandmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 3 });
-    drawLandmarks(canvasCtx, handLandmarks, { color: '#FF0000', lineWidth: 1, radius: 3 });
-
-    // Inferensi model
-    const inputVector = normalizeLandmarks(handLandmarks);
-    const tensorInput = tf.tensor2d([inputVector]);
-    const prediction = model.predict(tensorInput);
-    const probabilities = await prediction.data();
-    tensorInput.dispose();
-    prediction.dispose();
-
-    // Dapatkan label dengan probabilitas tertinggi
-    const maxProb = Math.max(...probabilities);
-    const predIndex = probabilities.indexOf(maxProb);
-    const detectedLabel = labels[predIndex];
-
-    if (maxProb > 0.75) {
-      confidenceEl.innerText = `Akurasi: ${(maxProb * 100).toFixed(1)}%`;
-      predictionBuffer.push(detectedLabel);
-      if (predictionBuffer.length > BUFFER_SIZE) predictionBuffer.shift();
-
-      // Debouncing: periksa apakah konsisten stabil
-      const isStable = predictionBuffer.every(val => val === detectedLabel);
-      if (isStable && predictionBuffer.length === BUFFER_SIZE) {
-        predictedCharEl.innerText = detectedLabel;
-
-        if (detectedLabel !== lastSpokenChar) {
-          speak(detectedLabel);
-          lastSpokenChar = detectedLabel;
-
-          // Tambahkan ke rangkaian teks
-          if (accumulatedTextEl.innerText === "Belum ada input...") {
-            accumulatedTextEl.innerText = detectedLabel;
-          } else {
-            accumulatedTextEl.innerText += detectedLabel;
-          }
-        }
-      }
-    } else {
-      confidenceEl.innerText = "Akurasi: Terlalu Rendah";
-    }
-  } else {
-    predictionBuffer = [];
-    predictedCharEl.innerText = "-";
-    confidenceEl.innerText = "Akurasi: 0%";
-  }
-  canvasCtx.restore();
+    // Gambar titik sendi merah
+    landmarks.forEach(pt => {
+      canvasCtx.beginPath();
+      canvasCtx.arc(pt.x * canvasElement.width, pt.y * canvasElement.height, 4, 0, 2 * Math.PI);
+      canvasCtx.fillStyle = '#ef4444';
+      canvasCtx.fill();
+    });
+  });
 }
 
-// 5. Inisialisasi MediaPipe Hands & Kamera
+// 3. Inisialisasi MediaPipe Hands (Maksimal 2 Tangan)
 const hands = new Hands({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
 });
 
 hands.setOptions({
-  maxNumHands: 1,
+  maxNumHands: 2,
   modelComplexity: 1,
-  minDetectionConfidence: 0.7,
-  minTrackingConfidence: 0.7
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
 });
-hands.onResults(onResults);
 
+hands.onResults(async (results) => {
+  // Samakan ukuran kanvas dengan video feed
+  canvasElement.width = videoElement.videoWidth;
+  canvasElement.height = videoElement.videoHeight;
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    // Gambar kerangka tangan di kanvas
+    drawSkeleton(results.multiHandLandmarks);
+
+    // Lakukan prediksi hanya jika model sudah siap
+    if (isModelReady && window.normalizeLandmarks126) {
+      const inputVector = window.normalizeLandmarks126(results);
+
+      if (inputVector) {
+        predictGesture(inputVector);
+      }
+    }
+  } else {
+    // Reset status jika tangan keluar dari frame kamera
+    consecutiveCount = 0;
+    if (accuracyEl) accuracyEl.textContent = "Akurasi: 0%";
+  }
+});
+
+// 4. Proses Inferensi Model AI
+async function predictGesture(features126) {
+  tf.tidy(() => {
+    const inputTensor = tf.tensor2d([features126], [1, 126]);
+    const output = model.predict(inputTensor);
+    const probabilities = output.dataSync();
+
+    let maxProb = 0;
+    let maxIndex = 0;
+    for (let i = 0; i < probabilities.length; i++) {
+      if (probabilities[i] > maxProb) {
+        maxProb = probabilities[i];
+        maxIndex = i;
+      }
+    }
+
+    const detectedLabel = window.getLabelByIndex(maxIndex);
+    const confidencePct = (maxProb * 100).toFixed(1);
+
+    // Perbarui UI karakter & akurasi
+    if (currentPredictionEl) currentPredictionEl.textContent = detectedLabel;
+    if (accuracyEl) accuracyEl.textContent = `Akurasi: ${confidencePct}%`;
+
+    // Filter stabilisasi: Simpan kata jika posisi stabil di atas ambang batas
+    if (maxProb >= CONFIDENCE_THRESHOLD) {
+      if (detectedLabel === lastDetectedChar) {
+        consecutiveCount++;
+        if (consecutiveCount === CONSECUTIVE_THRESHOLD) {
+          appendWord(detectedLabel);
+          consecutiveCount = 0; // reset counter
+        }
+      } else {
+        lastDetectedChar = detectedLabel;
+        consecutiveCount = 1;
+      }
+    } else {
+      consecutiveCount = 0;
+    }
+  });
+}
+
+// 5. Rangkaian Kata & Logika Text-to-Speech
+function appendWord(charOrWord) {
+  sentenceBuffer.push(charOrWord);
+  renderSentence();
+}
+
+function renderSentence() {
+  if (sentenceEl) {
+    sentenceEl.textContent = sentenceBuffer.join(' ');
+  }
+}
+
+function speakText(text) {
+  if (!text || !('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel(); // Hentikan suara yang sedang berjalan
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = 'id-ID';
+  utterance.rate = 0.95;
+  window.speechSynthesis.speak(utterance);
+}
+
+// Tombol Aksi
+if (btnSpeak) {
+  btnSpeak.onclick = () => {
+    const fullText = sentenceBuffer.join(' ');
+    speakText(fullText || (currentPredictionEl ? currentPredictionEl.textContent : ""));
+  };
+}
+
+if (btnClear) {
+  btnClear.onclick = () => {
+    sentenceBuffer = [];
+    renderSentence();
+    if (currentPredictionEl) currentPredictionEl.textContent = "-";
+    if (accuracyEl) accuracyEl.textContent = "Akurasi: 0%";
+  };
+}
+
+// 6. Inisialisasi Kamera Depan
 const camera = new Camera(videoElement, {
   onFrame: async () => {
     await hands.send({ image: videoElement });
@@ -143,22 +199,4 @@ const camera = new Camera(videoElement, {
   width: 640,
   height: 480
 });
-
-// Event Listener Tombol
-document.getElementById('btn-speak').addEventListener('click', () => {
-  const currentText = accumulatedTextEl.innerText;
-  if (currentText !== "Belum ada input...") {
-    speak(currentText);
-  }
-});
-
-document.getElementById('btn-clear').addEventListener('click', () => {
-  accumulatedTextEl.innerText = "Belum ada input...";
-  lastSpokenChar = "";
-  predictionBuffer = [];
-});
-
-// Jalankan sistem
-loadResources().then(() => {
-  camera.start();
-});
+camera.start();
