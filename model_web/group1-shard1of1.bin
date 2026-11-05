@@ -1,1 +1,23 @@
-1
+import os
+import tensorflow as tf
+import tensorflowjs as tfjs
+
+# 1. Bangun arsitektur model sesuai spesifikasi frontend (63 input -> 5 kelas output)
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(63,), name="input_coords"),
+    tf.keras.layers.Dense(128, activation='relu', name="dense_1"),
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.Dense(64, activation='relu', name="dense_2"),
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.Dense(5, activation='softmax', name="output_classes")
+])
+
+model.compile(optimizer='adam', loss='categorical_crossentropy')
+
+# 2. Simpan dan konversi langsung ke folder model_web
+output_dir = "model_web"
+os.makedirs(output_dir, exist_ok=True)
+tfjs.converters.save_keras_model(model, output_dir)
+
+print(f"Berhasil membuat berkas di folder '{output_dir}':")
+print(os.listdir(output_dir))
