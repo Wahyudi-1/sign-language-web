@@ -1,54 +1,54 @@
 /**
- * Normalisasi 21 titik koordinat landmark tangan dari MediaPipe.
- * Algoritma:
- * 1. Translasi: Menjadikan pergelangan tangan (wrist / indeks 0) sebagai titik pusat (0, 0, 0).
- * 2. Penskalaan: Membagi seluruh koordinat dengan jarak Euclidean terjauh dari pergelangan tangan.
- * 
- * @param {Array} landmarks - Array berisi 21 objek titik {x, y, z} dari MediaPipe Hands
- * @returns {Array<number>|null} Array 63 angka float [x0, y0, z0, x1, y1, z1, ..., x20, y20, z20]
+ * Normalisasi koordinat MediaPipe Hands ke 126 fitur terpadu:
+ * - Indeks 0 s.d. 62   : Tangan Kiri (21 landmark x 3 koordinat)
+ * - Indeks 63 s.d. 125 : Tangan Kanan (21 landmark x 3 koordinat)
+ * Jika hanya 1 tangan yang terdeteksi, slot tangan lainnya diisi 0.0.
  */
-function normalizeLandmarks(landmarks) {
-  if (!landmarks || landmarks.length !== 21) {
-    console.error("Landmarks tidak valid: Diperlukan tepat 21 titik sendi.");
+function normalizeLandmarks126(results) {
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
     return null;
   }
 
-  const base = landmarks[0];
-  const relativeCoords = [];
-  let maxDistance = 0;
+  let leftHandCoords = new Array(63).fill(0.0);
+  let rightHandCoords = new Array(63).fill(0.0);
 
-  // Langkah 1: Translasi koordinat relatif ke titik 0 & cari jarak terjauh
-  for (let i = 0; i < 21; i++) {
-    const dx = landmarks[i].x - base.x;
-    const dy = landmarks[i].y - base.y;
-    const dz = (landmarks[i].z !== undefined ? landmarks[i].z : 0) - 
-               (base.z !== undefined ? base.z : 0);
+  results.multiHandLandmarks.forEach((landmarks, index) => {
+    // MediaPipe label: 'Left' atau 'Right'
+    const handedness = results.multiHandedness && results.multiHandedness[index]
+      ? results.multiHandedness[index].label
+      : (index === 0 ? 'Right' : 'Left');
 
-    relativeCoords.push({ dx, dy, dz });
+    // 1. Normalisasi translasi: Jadikan wrist (titik 0) sebagai titik pusat (0,0,0)
+    const wrist = landmarks[0];
 
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dist > maxDistance) {
-      maxDistance = dist;
-    }
-  }
+    // 2. Normalisasi skala: Jarak dari wrist (0) ke pangkal jari tengah (MCP titik 9)
+    const refJoint = landmarks[9];
+    const scaleFactor = Math.hypot(
+      refJoint.x - wrist.x,
+      refJoint.y - wrist.y,
+      refJoint.z - wrist.z
+    ) || 1.0;
 
-  // Langkah 2: Penskalaan (Scale Invariance) & flattening ke array 63 elemen
-  const normalizedFeatures = [];
-  for (let i = 0; i < 21; i++) {
-    const pt = relativeCoords[i];
-    if (maxDistance > 0) {
-      normalizedFeatures.push(pt.dx / maxDistance);
-      normalizedFeatures.push(pt.dy / maxDistance);
-      normalizedFeatures.push(pt.dz / maxDistance);
+    const normalized = [];
+    landmarks.forEach(pt => {
+      normalized.push(
+        (pt.x - wrist.x) / scaleFactor,
+        (pt.y - wrist.y) / scaleFactor,
+        (pt.z - wrist.z) / scaleFactor
+      );
+    });
+
+    if (handedness === 'Left') {
+      leftHandCoords = normalized;
     } else {
-      normalizedFeatures.push(0, 0, 0);
+      rightHandCoords = normalized;
     }
-  }
+  });
 
-  return normalizedFeatures;
+  return [...leftHandCoords, ...rightHandCoords];
 }
 
-// Ekspos ke global window agar dapat langsung digunakan oleh app.js
+// Kompatibilitas global browser
 if (typeof window !== 'undefined') {
-  window.normalizeLandmarks = normalizeLandmarks;
+  window.normalizeLandmarks126 = normalizeLandmarks126;
 }
