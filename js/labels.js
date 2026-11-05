@@ -5,10 +5,7 @@
 const SIGN_LABELS = {
   0: "A",
   1: "B",
-  2: "C",
-  3: "D",
-  4: "E"
-  // Tambahkan kelas lain sesuai dataset yang Anda latih di Colab
+  2: "C"
 };
 
 /**
